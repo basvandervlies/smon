@@ -127,10 +127,15 @@ class SlurmRestClient:
             return ""
         msgs = []
         for err in data.get("errors") or []:
-            if isinstance(err, dict):
-                msgs.append(err.get("description") or err.get("error") or str(err))
-            else:
+            if not isinstance(err, dict):
                 msgs.append(str(err))
+                continue
+            # description: what slurmrestd tried, error: the Slurm error string
+            parts = [p for p in (err.get("description"), err.get("error")) if p]
+            msg = ": ".join(dict.fromkeys(parts)) or str(err)
+            if err.get("error_number"):
+                msg += f" (slurm error {err['error_number']})"
+            msgs.append(msg)
         return "; ".join(msgs)
 
     def get(self, endpoint):

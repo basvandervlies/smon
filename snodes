@@ -161,10 +161,15 @@ class SlurmRestClient:
             return ""
         msgs = []
         for err in data.get("errors") or []:
-            if isinstance(err, dict):
-                msgs.append(err.get("description") or err.get("error") or str(err))
-            else:
+            if not isinstance(err, dict):
                 msgs.append(str(err))
+                continue
+            # description: what slurmrestd tried, error: the Slurm error string
+            parts = [p for p in (err.get("description"), err.get("error")) if p]
+            msg = ": ".join(dict.fromkeys(parts)) or str(err)
+            if err.get("error_number"):
+                msg += f" (slurm error {err['error_number']})"
+            msgs.append(msg)
         return "; ".join(msgs)
 
     def _check(self, method, endpoint, status, data, raw):
@@ -719,6 +724,13 @@ class SaraNodes(object):
                     f"Slurm error while updating node(s) '{nodeset}': {e}",
                     file=sys.stderr,
                 )
+                if CLIENT.scheme == "unix" and "X-SLURM-USER-TOKEN" not in CLIENT.headers:
+                    print(
+                        "Hint: with local (unix socket) authentication slurmrestd sends the update as the\n"
+                        "      user slurmrestd runs as, not as you. Use a JWT of an admin user instead, e.g.:\n"
+                        "      export $(scontrol token username=root lifespan=300)",
+                        file=sys.stderr,
+                    )
         else:
             print(f"slurmrestd update {nodeset}: {json.dumps(changes)}")
 
