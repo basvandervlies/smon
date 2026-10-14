@@ -1,0 +1,21 @@
+# smon configuration (YAML)
+
+# --- rack layout -----------------------------------------------------------
+# Regex with the named groups 'racknr' and 'nodenr' to derive the position
+# of a node from its hostname, e.g. r12n07 -> rack 12, slot 7
+NODEXPR: 'r(?P<racknr>\d+)n(?P<nodenr>\d+)'
+# or a static layout (rack: [nodes in slot order])
+# STATIC_RACKLAYOUT:
+#   rack1: [node001, node002]
+EXCLUDED: []
+# ROTATE_90: true
+
+# --- slurmrestd ------------------------------------------------------------
+# http://host:port, https://proxy/path or unix:/path/to/slurmrestd.socket
+# Overridden by $SLURMRESTD_URL and --url.
+SLURMRESTD_URL: http://localhost:6820
+# Empty: use the newest of v0.0.45 .. v0.0.40 that slurmrestd offers.
+SLURMRESTD_API_VERSION: ''
+# User name sent with the JWT ($SLURM_JWT). Empty: the current user.
+SLURMRESTD_USER: ''
+SLURMRESTD_TIMEOUT: 30

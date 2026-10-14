@@ -11,30 +11,195 @@
 #
 """
 With smon you can print an overview of your Slurm nodes and their status.
+Data is retrieved from the Slurm REST API (slurmrestd).
 """
 
 import argparse
+import getpass
+import http.client
+import itertools
+import json
 import os
 import re
+import socket
 import sys
+from types import SimpleNamespace
+from urllib.parse import urlparse
 
-import pyslurm
 import yaml
 
+SMON_VERSION = "2.0.0 (slurmrestd)"
+
 # Settings
-settings = {"EXCLUDED": [], "NODEXPR": "", "STATIC_RACKLAYOUT": {}}
+settings = {
+    "EXCLUDED": [],
+    "NODEXPR": "",
+    "STATIC_RACKLAYOUT": {},
+    # slurmrestd connection settings. Can be overridden by the environment
+    # (SLURMRESTD_URL, SLURM_JWT) or the command line (--url, --api-version).
+    #   http://host:6820   https://proxy/slurmrestd   unix:/run/slurmrestd/slurmrestd.socket
+    "SLURMRESTD_URL": "http://localhost:6820",
+    # empty -> use the newest version offered by slurmrestd
+    "SLURMRESTD_API_VERSION": "",
+    # user name sent along with the JWT; empty -> current user
+    "SLURMRESTD_USER": "",
+    "SLURMRESTD_TIMEOUT": 30,
+}
+
+# data_parser versions this program understands, newest first. The fields
+# smon uses are the same in all of them.
+API_VERSIONS = ["v0.0.45", "v0.0.44", "v0.0.43", "v0.0.42", "v0.0.41", "v0.0.40"]
+
+
+class SlurmRestError(Exception):
+    pass
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection over a UNIX socket (slurmrestd local authentication)"""
+
+    def __init__(self, path, timeout):
+        super().__init__("localhost", timeout=timeout)
+        self.socket_path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+class SlurmRestClient:
+    """Minimal read-only slurmrestd client (standard library only)"""
+
+    def __init__(self, url, version="", user="", token=None, timeout=30):
+        self.url = url
+        self.version = version or None
+        self.timeout = timeout
+        parsed = urlparse(url)
+        self.scheme = parsed.scheme
+        if self.scheme == "unix":
+            self.socket_path = parsed.path
+            self.prefix = ""
+        elif self.scheme in ("http", "https"):
+            self.host = parsed.hostname
+            self.port = parsed.port
+            # allows a proxy that serves slurmrestd under a sub path
+            self.prefix = parsed.path.rstrip("/")
+        else:
+            raise SlurmRestError(f"unsupported slurmrestd URL: {url}")
+
+        self.headers = {"Accept": "application/json"}
+        if token:
+            self.headers["X-SLURM-USER-TOKEN"] = token
+            self.headers["X-SLURM-USER-NAME"] = user or getpass.getuser()
+        elif self.scheme != "unix":
+            raise SlurmRestError("no JWT found, set SLURM_JWT, e.g.: export $(scontrol token lifespan=3600)")
+
+    def _connection(self):
+        if self.scheme == "unix":
+            return _UnixHTTPConnection(self.socket_path, self.timeout)
+        if self.scheme == "https":
+            return http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout)
+        return http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
+
+    def _request(self, path):
+        conn = self._connection()
+        try:
+            conn.request("GET", self.prefix + path, headers=self.headers)
+            resp = conn.getresponse()
+            body = resp.read()
+        except OSError as err:
+            raise SlurmRestError(f"cannot connect to slurmrestd at {self.url}: {err}")
+        finally:
+            conn.close()
+
+        data = None
+        if body:
+            try:
+                data = json.loads(body)
+            except ValueError:
+                pass
+        return resp.status, data, body
+
+    @staticmethod
+    def _errors(data):
+        if not isinstance(data, dict):
+            return ""
+        msgs = []
+        for err in data.get("errors") or []:
+            if isinstance(err, dict):
+                msgs.append(err.get("description") or err.get("error") or str(err))
+            else:
+                msgs.append(str(err))
+        return "; ".join(msgs)
+
+    def get(self, endpoint):
+        """GET /slurm/<version>/<endpoint>, detecting the API version on first use"""
+        versions = [self.version] if self.version else API_VERSIONS
+        for version in versions:
+            status, data, body = self._request(f"/slurm/{version}/{endpoint}")
+            if status == 404 and not self.version:
+                continue  # this data_parser version is not loaded, try an older one
+            if status in (401, 403):
+                raise SlurmRestError(f"authentication failed (HTTP {status}) {self._errors(data)}".strip())
+            if status == 404:
+                raise SlurmRestError(f"{endpoint}: API version {version} is not available on slurmrestd at {self.url}")
+            if status != 200 or data is None:
+                detail = self._errors(data) or body[:200].decode(errors="replace")
+                raise SlurmRestError(f"GET {endpoint} returned HTTP {status}: {detail}")
+            if self._errors(data):
+                raise SlurmRestError(self._errors(data))
+            self.version = version
+            return data
+        raise SlurmRestError(
+            f"slurmrestd at {self.url} offers none of the supported API versions ({', '.join(API_VERSIONS)})"
+        )
+
+
+def _number(value, default=None):
+    """Unpack slurmrestd {"set": .., "infinite": .., "number": ..} objects"""
+    if isinstance(value, dict):
+        if value.get("set", True) and not value.get("infinite", False):
+            return value.get("number", default)
+        return default
+    return default if value is None else value
+
+
+def _expand_hostlist(hostlist):
+    """Expand a Slurm hostlist, e.g. 'r1n[01-03,07],gpu[1-2]'"""
+    hosts = []
+    # split on commas that are not inside brackets
+    for item in re.split(r",(?![^\[]*\])", hostlist or ""):
+        if not item:
+            continue
+        choices = []
+        for part in re.split(r"(\[[^\]]*\])", item):
+            if part.startswith("[") and part.endswith("]"):
+                values = []
+                for rng in part[1:-1].split(","):
+                    if "-" in rng:
+                        lo, hi = rng.split("-", 1)
+                        values += [str(i).zfill(len(lo)) for i in range(int(lo), int(hi) + 1)]
+                    else:
+                        values.append(rng)
+                choices.append(values)
+            elif part:
+                choices.append([part])
+        hosts += ["".join(c) for c in itertools.product(*choices)]
+    return hosts
 
 
 def read_conf(path, settings):
     if not os.path.exists(path):
         raise Exception(f"Couldn't find a configuration file at {path}")
     with open(path) as conf:
-        conf_settings = yaml.safe_load(conf)
+        conf_settings = yaml.safe_load(conf) or {}
         return {**settings, **conf_settings}
 
 
 class Smon:
-    def __init__(self, ignore=False, features="", printload=False):
+    def __init__(self, client, ignore=False, features="", printload=False):
+        self.client = client
         self.ignore = ignore
         self.features = set(features.split(",")) if features else set()
         self.printload = printload
@@ -89,22 +254,52 @@ class Smon:
         return [int(y) if y.isdigit() else y for y in re.split(r"(\d+)", basename)]
 
     def _get_nodes(self):
-        """Queries Slurm for node information"""
+        """Queries slurmrestd for node information
+
+        The REST objects are converted to objects with the attribute names
+        smon used before, so the rest of the code did not have to change.
+        """
         try:
-            self.nodes = pyslurm.Nodes.load()
-        # TODO: proper exception
-        except Exception:
-            print("Error: unable to get nodes from Slurm", file=sys.stderr)
+            data = self.client.get("nodes")
+        except SlurmRestError as err:
+            print(f"Error: unable to get nodes from slurmrestd: {err}", file=sys.stderr)
             sys.exit(1)
 
+        self.nodes = dict()
+        for n in data.get("nodes", []):
+            self.nodes[n["name"]] = SimpleNamespace(
+                # REST returns ["IDLE", "DRAIN", ...], the C API string is "IDLE+DRAIN"
+                state="+".join(n.get("state") or ["UNKNOWN"]),
+                partitions=n.get("partitions") or [],
+                available_features=n.get("features") or [],
+                # REST reports the load multiplied by 100 (as the C API does)
+                cpu_load=_number(n.get("cpu_load"), 0) / 100.0,
+                total_cpus=_number(n.get("cpus"), 0),
+                allocated_cpus=_number(n.get("alloc_cpus"), 0),
+                real_memory=_number(n.get("real_memory"), 0),
+                allocated_memory=_number(n.get("alloc_memory"), 0),
+                free_memory=_number(n.get("free_mem")),
+            )
+
     def _get_jobs(self):
-        """Queries Slurm for job information"""
+        """Queries slurmrestd for job information"""
         try:
-            self.jobs = pyslurm.Jobs.load()
-        # TODO: proper exception
-        except Exception:
-            print("Error: unable to get jobs from Slurm", file=sys.stderr)
+            data = self.client.get("jobs")
+        except SlurmRestError as err:
+            print(f"Error: unable to get jobs from slurmrestd: {err}", file=sys.stderr)
             sys.exit(1)
+
+        self.jobs = dict()
+        for j in data.get("jobs", []):
+            state = j.get("job_state") or []
+            if isinstance(state, str):
+                state = [state]
+            self.jobs[j["job_id"]] = SimpleNamespace(
+                state=state,
+                num_nodes=_number(j.get("node_count"), 0),
+                allocated_nodes=j.get("nodes") or "",
+                user_name=j.get("user_name", ""),
+            )
 
     def _parse_layout(self):
         for rack, nodes in sorted(settings["STATIC_RACKLAYOUT"].items(), key=lambda x: x[0]):
@@ -123,8 +318,7 @@ class Smon:
                 rack = positions.group("racknr")
                 slot = int(positions.group("nodenr"))
                 return (rack, slot)
-            # TODO: proper exception
-            except Exception:
+            except (AttributeError, IndexError, ValueError):
                 return False
         return False
 
@@ -133,7 +327,7 @@ class Smon:
         # Skip certain nodes
         if node in settings["EXCLUDED"]:
             return True
-        if self.ignore and not attr["partitions"]:
+        if self.ignore and not attr.partitions:
             return True
         if not self._parse_position(node):
             print(f"Can't find rack position for {node}", file=sys.stderr)
@@ -157,13 +351,12 @@ class Smon:
             cpuload = attr.cpu_load
             cpus = attr.total_cpus
 
-            # Calculate load for allocated nodes
+            # Calculate load (percentage of all cpus) for allocated nodes
             load = None
             if "IDLE" not in states and "DOWN" not in states:
                 try:
-                    load = float(cpuload) / cpus
-                # TODO: proper exception
-                except Exception:
+                    load = float(cpuload) * 100.0 / cpus
+                except (TypeError, ZeroDivisionError):
                     pass
 
             # Undefined node states are set to UNKNOWN
@@ -238,33 +431,18 @@ class Smon:
 
     def _expand_nodes(self, nodes):
         """Expands host ranges to a list of hostnames"""
-        # attempt to use python3-hostlist instead of deprecated Pyslurm API
         try:
             # https://www.nsc.liu.se/~kent/python-hostlist/
             import hostlist
 
-            nodelist = hostlist.expand_hostlist(nodes) if nodes else []
-            return nodelist
+            return hostlist.expand_hostlist(nodes) if nodes else []
         except ImportError:
-            pass
-
-        # fallback to deprecated Pyslurm API to expand the nodeset
-        try:
-            # NOTE: This API is currently being completely reworked, and is subject to be removed
-            # in the future when a replacement is introduced
-            p = pyslurm.hostlist()
-            p.create(nodes)
-            nodelist = [n.decode() for n in p.get_list()]
-            p.destroy()
-            return nodelist
-        except AttributeError:
-            print("Could not expand nodeset. Install python3-hostlist or use new Pyslurm API.", file=sys.stderr)
-            sys.exit(1)
+            return _expand_hostlist(nodes)
 
     def _parse_jobs(self):
         """Extracts hostnames from parallel jobs"""
         for _, attr in self.jobs.items():
-            if attr.num_nodes > 1:
+            if attr.num_nodes > 1 and "RUNNING" in attr.state:
                 self.parallel |= set(self._expand_nodes(attr.allocated_nodes))
 
     def print_table_90(self):
@@ -359,22 +537,27 @@ class Smon:
 
             if "ALLOCATED" in attr.state or "MIXED" in attr.state:
                 if skip_shared and "MIXED" in attr.state:
-                    n2j.pop(node)
+                    n2j.pop(node, None)
                     continue
 
                 n2j[node] = dict()
                 n2j[node]["state"] = attr.state
                 n2j[node]["real_memory"] = attr.real_memory
                 n2j[node]["alloc_mem"] = attr.allocated_memory
-                n2j[node]["free_mem"] = attr.free_memory
-                n2j[node]["used_mem"] = attr.real_memory - attr.free_memory
 
-                if n2j[node]["free_mem"] / n2j[node]["real_memory"] < mem_factor and not parsable:
-                    n2j[node]["free_mem"] = self._highlight(str(n2j[node]["free_mem"]).rjust(len_mem), "red")
+                free_mem = attr.free_memory
+                if free_mem is None:
+                    # slurmd has not reported the free memory (yet)
+                    n2j[node]["free_mem"] = "-"
+                    n2j[node]["used_mem"] = "-"
                 else:
-                    n2j[node]["free_mem"] = str(n2j[node]["free_mem"])
+                    n2j[node]["used_mem"] = str(attr.real_memory - free_mem)
+                    if attr.real_memory and free_mem / attr.real_memory < mem_factor and not parsable:
+                        n2j[node]["free_mem"] = self._highlight(str(free_mem).rjust(len_mem), "red")
+                    else:
+                        n2j[node]["free_mem"] = str(free_mem)
 
-                alloc_cpus = float(attr.allocated_cpus)
+                alloc_cpus = float(attr.allocated_cpus) or float(attr.total_cpus) or 1.0
                 cpu_load = float(attr.cpu_load) / alloc_cpus * 100
 
                 if abs(cpu_load - 100) > load_treshold and not parsable:
@@ -444,7 +627,7 @@ class Smon:
             try:
                 if not parsable:
                     print(
-                        "%-*s | %-*s | %-*s | %*s | %*d | %*d | %*s | %*d"
+                        "%-*s | %-*s | %-*s | %*s | %*d | %*d | %*s | %*s"
                         % (
                             len_node,
                             n,
@@ -466,7 +649,7 @@ class Smon:
                     )
                 else:
                     print(
-                        "%s|%s|%s|%s|%d|%d|%s|%d"
+                        "%s|%s|%s|%s|%d|%d|%s|%s"
                         % (
                             n,
                             n2j[n]["job"],
@@ -552,7 +735,16 @@ if __name__ == "__main__":
         default=f"{os.path.dirname(os.path.abspath(__file__))}/../etc/smon.conf",
         help="Path to configuration file",
     )
-    parser.add_argument("--version", action="version", version=pyslurm.__version__)
+    parser.add_argument(
+        "--url",
+        help="slurmrestd URL (http://host:port, https://..., unix:/path/to/socket). "
+        "Default: $SLURMRESTD_URL, else SLURMRESTD_URL from the configuration file",
+    )
+    parser.add_argument(
+        "--api-version",
+        help="slurmrestd API version, e.g. v0.0.44 (default: newest available)",
+    )
+    parser.add_argument("--version", action="version", version=SMON_VERSION)
 
     # Parse the arguments
     args = parser.parse_args()
@@ -560,8 +752,21 @@ if __name__ == "__main__":
     # Load settings
     settings = read_conf(args.conf, settings)
 
+    # Connect to slurmrestd: command line > environment > configuration file
+    try:
+        client = SlurmRestClient(
+            url=args.url or os.environ.get("SLURMRESTD_URL") or settings["SLURMRESTD_URL"],
+            version=args.api_version or settings["SLURMRESTD_API_VERSION"],
+            user=settings["SLURMRESTD_USER"],
+            token=os.environ.get("SLURM_JWT"),
+            timeout=settings["SLURMRESTD_TIMEOUT"],
+        )
+    except SlurmRestError as err:
+        print(f"Error: {err}", file=sys.stderr)
+        sys.exit(1)
+
     # Initialize Smon class
-    smon = Smon(ignore=args.ignore, features=args.features, printload=args.printload)
+    smon = Smon(client, ignore=args.ignore, features=args.features, printload=args.printload)
 
     if args.list:
         smon.print_node_info(
