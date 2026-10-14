@@ -15,7 +15,6 @@ Data is retrieved from the Slurm REST API (slurmrestd).
 """
 
 import argparse
-import getpass
 import http.client
 import itertools
 import json
@@ -41,7 +40,7 @@ settings = {
     "SLURMRESTD_URL": "http://localhost:6820",
     # empty -> use the newest version offered by slurmrestd
     "SLURMRESTD_API_VERSION": "",
-    # user name sent along with the JWT; empty -> current user
+    # user to act as with a root/SlurmUser JWT; empty -> the user in the token
     "SLURMRESTD_USER": "",
     "SLURMRESTD_TIMEOUT": 30,
 }
@@ -91,7 +90,10 @@ class SlurmRestClient:
         self.headers = {"Accept": "application/json"}
         if token:
             self.headers["X-SLURM-USER-TOKEN"] = token
-            self.headers["X-SLURM-USER-NAME"] = user or getpass.getuser()
+            # Without a user name slurmctld takes the user from the token. It is
+            # only needed when a root/SlurmUser token acts on behalf of a user.
+            if user:
+                self.headers["X-SLURM-USER-NAME"] = user
         elif self.scheme != "unix":
             raise SlurmRestError("no JWT found, set SLURM_JWT, e.g.: export $(scontrol token lifespan=3600)")
 
@@ -146,7 +148,11 @@ class SlurmRestClient:
             if status == 404 and not self.version:
                 continue  # this data_parser version is not loaded, try an older one
             if status in (401, 403):
-                raise SlurmRestError(f"authentication failed (HTTP {status}) {self._errors(data)}".strip())
+                raise SlurmRestError(
+                    f"authentication failed (HTTP {status}) {self._errors(data)}".strip()
+                    + " (expired token, token for another user than SLURMRESTD_USER,"
+                    " or slurmrestd without rest_auth/jwt?)"
+                )
             if status == 404:
                 raise SlurmRestError(f"{endpoint}: API version {version} is not available on slurmrestd at {self.url}")
             if status != 200 or data is None:
