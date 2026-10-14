@@ -1,0 +1,607 @@
+#!/usr/bin/python3
+#
+# Author: Martijn Kruiten
+# Date  : 11th of June 2018
+#
+# Code is based on sara_nodes by Dennis Stam (SURF, 2012)
+#
+"""
+You can use slurm_nodes to change the state of a node with an optional
+reference to a ticket number.
+"""
+
+import argparse
+import sys
+import time
+
+import pyslurm
+
+# Lengths to truncate columns
+TRUNC = {"REASON": 23, "TICKET": 9, "NODELIST": 58}
+
+# States to show in overview
+# NOTE: I'm not exactly sure where to get these labels from
+DOWN_STATES = {
+    "DOWN",
+    "DRAIN",
+    "ERROR",
+    "INVALID_REG",
+    "FAIL",
+    "FAILING",
+    "FUTURE",
+    "MAINTENANCE",
+    "NOT_RESPONDING",
+    "REBOOT_ISSUED",
+    "REBOOT_REQUESTED",
+    "RESERVED",
+    "UNKNOWN",
+}
+
+# Global variables set by input arguments
+ARGS_QUIET = False
+ARGS_DEBUG = False
+ARGS_VERBOSE = False
+ARGS_IGNORE = False
+ARGS_DRYRUN = False
+ARGS_EXPAND = False
+ARGS_LONG = False
+
+
+def expand_nodes(nodelist):
+    """Expand node range expression to list of nodes"""
+    # attempt to use python3-hostlist instead of deprecated Pyslurm API
+    try:
+        # https://www.nsc.liu.se/~kent/python-hostlist/
+        import hostlist
+
+        return set(hostlist.expand_hostlist(",".join(nodelist)))
+    except ImportError:
+        pass
+
+    # fallback to deprecated Pyslurm API to expand the nodeset
+    try:
+        # NOTE: This API is currently being completely reworked, and is subject to be removed
+        # in the future when a replacement is introduced
+        nodes = pyslurm.hostlist()
+        nodes.create(",".join(nodelist))
+        return set([n.decode("utf-8") for n in nodes.get_list()])
+    except AttributeError:
+        print("Could not expand nodeset. Install python3-hostlist or use new Pyslurm API.", file=sys.stderr)
+        sys.exit(1)
+
+
+def compact_nodes(nodelist):
+    """Compact list of individual nodes to single host range expression"""
+    # attempt to use python3-hostlist instead of deprecated Pyslurm API
+    try:
+        # https://www.nsc.liu.se/~kent/python-hostlist/
+        import hostlist
+
+        nodeset = hostlist.collect_hostlist(nodelist)
+        return (len(nodelist), nodeset)
+    except ImportError:
+        pass
+
+    # fallback to deprecated Pyslurm API to compact the nodeset
+    try:
+        # NOTE: This API is currently being completely reworked, and is subject to be removed
+        # in the future when a replacement is introduced
+        nodes = pyslurm.hostlist()
+        nodes.create(",".join(nodelist))
+        return (nodes.count(), nodes.ranged_string())
+    except AttributeError:
+        print("Could not compact nodeset. Install python3-hostlist or use new Pyslurm API.", file=sys.stderr)
+        sys.exit(1)
+
+
+def get_exec_nodes(joblist):
+    """Get nodes belonging to specified job(s)"""
+    slurm_jobs = pyslurm.Jobs.load()
+    nodes = list()
+    joblist = set([int(x) for x in joblist])
+
+    nonexistent = joblist - set(slurm_jobs.keys())
+    if nonexistent:
+        print(
+            f"Cannot find job(s) {','.join((str(x) for x in nonexistent))}",
+            file=sys.stderr,
+        )
+
+    joblist = joblist - nonexistent
+    for job in joblist:
+        if slurm_jobs[job].allocated_nodes:
+            nodes.append(slurm_jobs[job].allocated_nodes)
+
+    if nodes:
+        return get_nodes(expand_nodes(nodes))
+    return dict()
+
+
+def get_nodes(hosts=set()):
+    """Get and filter nodes"""
+    if ARGS_DEBUG:
+        print(f"func:get_nodes input:{hosts}", file=sys.stderr)
+
+    select = bool(hosts)
+    hosts = expand_nodes(hosts)
+
+    if ARGS_DEBUG:
+        print("func:get_nodes fetching node information", file=sys.stderr)
+
+    # Get all nodes with their properties
+    nodes = pyslurm.Nodes.load()
+    selection = pyslurm.Nodes()
+    for host, properties in nodes.items():
+        states = set(properties.state.split("+"))
+        # Select nodes that were specified by the user
+        if not select:
+            # Select nodes that are online but have no partition
+            if not properties.partitions:
+                properties.reason = "No partition"
+            # Select nodes based on node state
+            elif not bool(DOWN_STATES.intersection(states)):
+                continue
+        elif not hosts:
+            break
+        elif host in hosts:
+            hosts.remove(host)
+        else:
+            continue
+
+        selection.add(properties)
+
+    if hosts:
+        print(f"Cannot find node(s) {compact_nodes(hosts)[1]}", file=sys.stderr)
+
+    if ARGS_DEBUG:
+        print("func:get_nodes returning values", file=sys.stderr)
+    return selection
+
+
+def parse_properties(nodes):
+    """Parse the properties into a common format that can be printed"""
+    if ARGS_DEBUG:
+        print(f"func:parse_properties input:{nodes}", file=sys.stderr)
+
+    printline = list()
+    if ARGS_DEBUG:
+        print("func:parse_properties processing data", file=sys.stderr)
+
+    groups = dict()
+    timeformat = "%d %b %H:%M"
+    now = int(time.time())
+
+    # Sort on reason
+    for host, properties in sorted(nodes.items(), key=lambda item: item[1].reason or ""):
+        # Skip certain nodes in ignore mode
+        if ARGS_IGNORE:
+            if not properties.partitions:
+                continue
+            if "MAINTENANCE" in properties.state:
+                continue
+            if not properties.reason in properties.reason:
+                continue
+
+        # Create a dictionary with node properties
+        props = dict()
+        props["nodename"] = [host]
+        props["state"] = properties.state.lower()
+        props["date"] = properties.reason_time or now
+        if properties.reason_user:
+            props["username"] = properties.reason_user
+        else:
+            props["username"] = ""
+
+        reason = properties.reason
+        if reason:
+            reasonstate = reason + "|" + props["state"]
+        else:
+            reasonstate = props["state"]
+
+        # Add to group if reason and state combi already exists
+        if reasonstate in groups and not ARGS_EXPAND:
+            groups[reasonstate]["nodename"] += props["nodename"]
+            if props["date"] > groups[reasonstate]["date"]:
+                groups[reasonstate]["date"] = props["date"]
+        else:
+            # Split reason into note and ticket number
+            if reason:
+                note = reason.split("+")
+            else:
+                note = [""]
+
+            if len(note) > 1:
+                props["ticket"] = note[0]
+                props["note"] = ", ".join(note[1:])
+            else:
+                # This is a Slurm generated reason without a ticket number
+                props["ticket"] = ""
+                props["note"] = note[0]
+
+            if ARGS_EXPAND:
+                props["count"] = 1
+                props["nodename"] = props["nodename"][0]
+                props["date"] = time.strftime(timeformat, time.localtime(props["date"]))
+                printline.append(props)
+            else:
+                # Create group for reason and state combination
+                groups[reasonstate] = props
+
+    if not ARGS_EXPAND:
+        # Add lines for node groups in proper order
+        for reasonstate in groups:
+            line = groups[reasonstate]
+            line["count"], line["nodename"] = compact_nodes(line["nodename"])
+            line["date"] = time.strftime(timeformat, time.localtime(line["date"]))
+            printline.append(line)
+
+    if ARGS_DEBUG:
+        print("func:parse_properties returning values", file=sys.stderr)
+
+    return printline
+
+
+def format_strings(unformatted):
+    """Format strings for printing"""
+    formatted = list()
+    for length, string in unformatted:
+        formatted.append(f"{string:<{length}}")
+    return formatted
+
+
+def print_overview(hosts={}):
+    """Print the default overview"""
+    if ARGS_DEBUG:
+        print(f"func:print_overview input:{hosts}", file=sys.stderr)
+
+    # Set label and width for node properties
+    labels = {
+        "note": "REASON",
+        "ticket": "TICKET",
+        "username": "USER",
+        "date": "MODIFIED",
+        "count": "COUNT",
+        "state": "STATE",
+        "nodename": "NODELIST",
+    }
+    widths = dict()
+    for prop in labels:
+        widths[prop] = 0
+
+    # Create a sorted list of nodes with non-matching nodes first
+    print_list = parse_properties(hosts)
+
+    # Stop here if there is nothing to show
+    if not print_list:
+        if not ARGS_QUIET:
+            print("Nothing to show!")
+        return
+
+    # Determine the column widths
+    for line in print_list:
+        if line["ticket"]:
+            line["ticket"] = line["ticket"]
+        line["count"] = str(line["count"])
+        for prop, label in labels.items():
+            # Node count is only printed if nodes are clustered
+            if prop == "count" and line[prop] == "1":
+                continue
+            if not ARGS_LONG and prop in ["username", "date"]:
+                continue
+            # Set width to full or truncated width
+            proplen = len(line[prop])
+            if line[prop] and proplen > widths[prop]:
+                if not ARGS_LONG and label in TRUNC:
+                    widths[prop] = min(proplen, TRUNC[label])
+                else:
+                    widths[prop] = proplen
+
+    # Width can not be less than label length
+    for prop, label in labels.items():
+        if widths[prop] > 0:
+            widths[prop] = max(widths[prop], len(label))
+
+    # Print only columns that have values
+    columns = []
+    for prop, label in labels.items():
+        if widths[prop] > 0:
+            columns.append((widths[prop], label))
+    print(f" {' | '.join(format_strings(columns))}")
+    print(f"{'+'.join('-' * (column[0] + 2) for column in columns)}")
+
+    # Prepare and print the node states and properties
+    for line in print_list:
+        line_columns = []
+        for prop, label in labels.items():
+            if widths[prop] > 0:
+                if prop == "count":
+                    line[prop] = line[prop].rjust(widths[prop])
+                elif line[prop] is None:
+                    line[prop] = ""
+                elif not ARGS_LONG and label in TRUNC:
+                    if len(line[prop]) > TRUNC[label]:
+                        line[prop] = line[prop][: TRUNC[label] - 2]
+                        line[prop] = line[prop] + ".."
+                line_columns.append((widths[prop], line[prop]))
+        print(f" {' | '.join(format_strings(line_columns))}")
+
+
+def print_format(hosts={}, printformat=""):
+    """Print in custom format for scripting"""
+    print_list = parse_properties(hosts)
+
+    for line in print_list:
+        print(f"{printformat % line}")
+
+
+class SaraNodes(object):
+    """This class is used to change node states or properties"""
+
+    def __init__(self):
+        self.ticket = None
+
+    def _get_current_notes(self, nodes):
+        """Retrieve all nodes with notes and/or tickets"""
+        if ARGS_DEBUG:
+            print(
+                f"class:SaraNodes func:_get_current_notes input:{nodes}",
+                file=sys.stderr,
+            )
+
+        notes = dict()
+        for node, properties in nodes.items():
+            if properties.reason:
+                notes[node] = properties.reason.split("+")
+        return notes
+
+    def _get_ticket(self, prev_ticket=None):
+        """Check if we already have a ticket number"""
+        if ARGS_DEBUG:
+            print(
+                f"class:SaraNodes func:_get_ticket input:{prev_ticket}",
+                file=sys.stderr,
+            )
+        cur_ticket = "%s" % self.ticket
+        if prev_ticket and cur_ticket == prev_ticket:
+            return prev_ticket
+        elif self.ticket is not None:
+            return cur_ticket
+        elif prev_ticket:
+            return prev_ticket
+        return ""
+
+    def _generate_note(self, nodes, note, append):
+        """Generate the note in a specific format"""
+        if ARGS_DEBUG:
+            print(
+                f"class:SaraNodes func:_generate_note input:{nodes},{note},{append}",
+                file=sys.stderr,
+            )
+
+        cur_data = self._get_current_notes(nodes)
+
+        reasons = dict()
+        for node in nodes:
+            ticket = nnote = None
+            # Get and update current ticket
+            if node in cur_data.keys() and len(cur_data[node]) > 1:
+                ticket = self._get_ticket(cur_data[node][0])
+                nnote = cur_data[node][1:]
+            else:
+                ticket = self._get_ticket()
+                nnote = []
+
+            # Add, replace or append note
+            if note is not None:
+                if "+" in note:
+                    print("Illegal character: '+'", file=sys.stderr)
+                    exit(1)
+
+                if not append or nnote == [""]:
+                    nnote = [note]
+                elif note and note.lower() not in [n.lower() for n in nnote]:
+                    nnote.append(note)
+
+            reasons[node] = "%s+%s" % (ticket, "+".join(nnote))
+        return reasons
+
+    def drain_node(self, nodes, note, append=True):
+        """Change the state of node(s) to offline with a specific note"""
+        if ARGS_DEBUG:
+            print(
+                f"class:SaraNodes func:drain_node input:{nodes},{note}",
+                file=sys.stderr,
+            )
+
+        # again a loop, now create the attrib dict list
+        change_dict = {}
+        for node, note in self._generate_note(nodes, note, append).items():
+            if note not in change_dict:
+                changes = pyslurm.Node(state="DRAIN", reason=note)
+                change_dict[note] = (pyslurm.Nodes(), changes)
+            change_dict[note][0].add(nodes[node])
+
+        for nodes, changes in change_dict.values():
+            self._process(nodes, changes)
+
+    def resume_node(self, nodes):
+        """Clear the state on a node(s) to resume, also clear the note"""
+        if ARGS_DEBUG:
+            print(
+                f"class:SaraNodes func:resume_node input:{nodes}",
+                file=sys.stderr,
+            )
+
+        drained = self._get_current_notes(nodes)
+
+        # Resume node if it has a reason (otherwise do nothing)
+        changes = pyslurm.Node(state="RESUME")
+        selection = pyslurm.Nodes()
+        skip = list()
+        for node in nodes:
+            if node in drained:
+                selection.add(nodes[node])
+            else:
+                skip.append(node)
+
+        if ARGS_DEBUG:
+            print(f"Node(s) {compact_nodes(skip)[1]} are already in an allowed state")
+
+        # Resume nodes
+        if selection:
+            changes = pyslurm.Node(state="RESUME")
+            self._process(selection, changes)
+
+    def _process(self, nodes, changes):
+        """This function executes the change to the batch server"""
+        if ARGS_DEBUG:
+            print(
+                f"class:SaraNodes func:_process input:{nodes},{changes}",
+                file=sys.stderr,
+            )
+
+        # Execute the changes
+        if not ARGS_DRYRUN:
+            try:
+                nodes.modify(changes)
+            except Exception as e:
+                print(
+                    f"Slurm error while updating node(s) '{compact_nodes(nodes.keys())[1]}': {e}",
+                    file=sys.stderr,
+                )
+        else:
+            print("slurm.update(%s)" % str(nodes))
+
+
+if __name__ == "__main__":
+    # Define and parse the input arguments
+    HELP_EPILOG = """
+                  The format argument uses the Python string formatting. Fields
+                  that can be used are; nodename, state, date, username, ticket
+                  and note. For example slurm_nodes -f '%(nodename)s;%(state)s'
+                  """
+    parser = argparse.ArgumentParser(description=__doc__, epilog=HELP_EPILOG)
+    # sadly positional and optional args can't be made mutually exclusive
+    parser.add_argument("nodes", metavar="NODES", nargs="*", type=str)
+    parser.add_argument("-j", "--jobs", nargs="+", type=str, help="use job IDs instead of nodenames")
+    parser.add_argument("-d", "--debug", action="store_true", help="enables debug mode")
+    parser.add_argument("-v", "--verbose", action="store_true", help="enables verbose mode")
+    parser.add_argument("-e", "--expand", action="store_true", help="enables expanded hostnames")
+    parser.add_argument(
+        "-i",
+        "--ignore",
+        action="store_true",
+        help="ignores nodes without partitions or drain reasons, with vendor drain reasons and nodes in maintenance reservations",
+    )
+    parser.add_argument(
+        "-a",
+        "--all",
+        action="store_true",
+        help="show all node states (ignore --ignore flag)",
+    )
+    parser.add_argument(
+        "-l",
+        "--long",
+        action="store_true",
+        help="prints long output of reasons and nodelists and adds user and date fields",
+    )
+    parser.add_argument("-n", "--dry-run", action="store_true", help="enables dry-run mode")
+    parser.add_argument("-q", "--quiet", action="store_true", help="enables to supress all feedback")
+    parser.add_argument("-o", "--offline", metavar="NOTE", help="change state to offline with message")
+    parser.add_argument("-m", "--modify", metavar="NOTE", help="change the message of a node")
+    parser.add_argument("-c", "--clear", action="store_true", help="change the state to down")
+    parser.add_argument("-N", "--clear-note", action="store_true", help="clear the message of a node")
+    parser.add_argument("-T", "--clear-ticket", action="store_true", help="clear the ticket of a node")
+    parser.add_argument(
+        "-f",
+        "--format",
+        metavar="FORMAT",
+        help="change the output of slurm_nodes (see footer)",
+    )
+    parser.add_argument(
+        "-t",
+        "--ticket",
+        metavar="TICKET",
+        type=str,
+        help="add a ticket number to a node",
+    )
+    parser.add_argument("--version", action="version", version=pyslurm.__version__)
+    args = parser.parse_args()
+
+    # The options quiet, ignore, debug, verbose and dry-run are processed first
+    if args.quiet:
+        ARGS_QUIET = True
+    if args.debug:
+        ARGS_DEBUG = True
+    if args.verbose:
+        ARGS_VERBOSE = True
+    if args.ignore and not args.all and not args.nodes:
+        ARGS_IGNORE = True
+    if args.dry_run:
+        ARGS_DRYRUN = ARGS_DEBUG = True
+    if args.expand:
+        ARGS_EXPAND = True
+    if args.long:
+        ARGS_LONG = True
+    if args.clear_ticket:
+        args.ticket = ""
+
+    if ARGS_DEBUG:
+        print("func:__main__ checking type of operation", file=sys.stderr)
+
+    # Determine if nodes or jobs were specified
+    if args.jobs:
+        if args.nodes:
+            print("Nodesets can't be combined with job IDs.", file=sys.stderr)
+            exit(1)
+        nodes = get_exec_nodes(args.jobs)
+    elif args.nodes:
+        nodes = get_nodes(args.nodes)
+    else:
+        nodes = get_nodes()
+
+    # Initiate SaraNodes if we need to change node states or properties
+    if args.offline or args.modify or args.clear or args.clear_note or args.clear_ticket or args.ticket:
+        if not args.nodes:
+            print("You did not specify any nodes, see --help", file=sys.stderr)
+            sys.exit(1)
+
+        sn = SaraNodes()
+        if args.ticket is not None:
+            sn.ticket = args.ticket
+
+        if args.offline is not None:
+            if ARGS_DEBUG:
+                print("func:__main__ call sn.drain_node", file=sys.stderr)
+            sn.drain_node(nodes, args.offline)
+        elif args.modify is not None:
+            if ARGS_DEBUG:
+                print("func:__main__ call sn.drain_node", file=sys.stderr)
+            sn.drain_node(nodes, args.modify, append=False)
+        elif args.clear:
+            if ARGS_DEBUG:
+                print("func:__main__ call sn.resume_node", file=sys.stderr)
+            sn.resume_node(nodes)
+        elif args.clear_note:
+            if ARGS_DEBUG:
+                print("func:__main__ call sn.drain_node", file=sys.stderr)
+            sn.drain_node(nodes, note="", append=False)
+        elif args.ticket is not None:
+            if ARGS_DEBUG:
+                print("func:__main__ call sn.do_modify")
+            sn.drain_node(nodes, "")
+    else:
+        if ARGS_DRYRUN:
+            print("Dry-run is not available when querying", file=sys.stderr)
+
+        if args.format:
+            if ARGS_DEBUG:
+                print("func:__main__ call print_format", file=sys.stderr)
+            print_format(nodes, args.format)
+        else:
+            if ARGS_DEBUG:
+                print("func:__main__ call print_overview", file=sys.stderr)
+            print_overview(nodes)
+
+    if ARGS_DEBUG:
+        print("func:__main__ exit", file=sys.stderr)
