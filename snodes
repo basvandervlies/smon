@@ -175,7 +175,7 @@ class SlurmRestClient:
         return "; ".join(msgs)
 
     def _check(self, method, endpoint, status, data, raw):
-        if status in (401, 403):
+        if status in (401, 403, 511):
             raise SlurmRestError(
                 f"authentication failed (HTTP {status}) {self._errors(data)}".strip()
                 + " (expired token, token for another user than SLURMRESTD_USER,"

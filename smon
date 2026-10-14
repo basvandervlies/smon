@@ -147,7 +147,7 @@ class SlurmRestClient:
             status, data, body = self._request(f"/slurm/{version}/{endpoint}")
             if status == 404 and not self.version:
                 continue  # this data_parser version is not loaded, try an older one
-            if status in (401, 403):
+            if status in (401, 403, 511):
                 raise SlurmRestError(
                     f"authentication failed (HTTP {status}) {self._errors(data)}".strip()
                     + " (expired token, token for another user than SLURMRESTD_USER,"
