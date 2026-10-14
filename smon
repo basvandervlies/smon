@@ -1,0 +1,584 @@
+#!/usr/bin/python3
+#
+# Authors:
+#   Martijn Kruiten, SURF
+#   Dennis Stam, SURF
+#   Bas van der Vlies, SURF
+#
+# Heavily inspired on pbsmon by:
+#   Dennis Stam, SURF
+#   Bas van der Vlies, SURF
+#
+"""
+With smon you can print an overview of your Slurm nodes and their status.
+"""
+
+import argparse
+import os
+import re
+import sys
+
+import pyslurm
+import yaml
+
+# Settings
+settings = {"EXCLUDED": [], "NODEXPR": "", "STATIC_RACKLAYOUT": {}}
+
+
+def read_conf(path, settings):
+    if not os.path.exists(path):
+        raise Exception(f"Couldn't find a configuration file at {path}")
+    with open(path) as conf:
+        conf_settings = yaml.safe_load(conf)
+        return {**settings, **conf_settings}
+
+
+class Smon:
+    def __init__(self, ignore=False, features="", printload=False):
+        self.ignore = ignore
+        self.features = set(features.split(",")) if features else set()
+        self.printload = printload
+        self.table = dict()
+        self.racks = list()
+        self.parallel = set()
+        self.skip_nodes = set()
+        self.desc_len = 0
+        self.count_len = 0
+        self.layout = dict()
+        self._parse_layout()
+        self._get_jobs()
+        self._parse_jobs()
+        self._get_nodes()
+        self._get_states()
+        self._parse_nodes()
+
+    def _get_states(self):
+        """Sets all the supported states"""
+        self.states = {
+            "ALLOCATED": {"description": "allocated", "sign": "j"},
+            "PARALLEL": {"description": "allocated (parallel)", "sign": "J"},
+            "MIXED": {"description": "allocated (shared)", "sign": "S"},
+            "OVERLOAD": {"description": "allocated (overload)", "sign": "*"},
+            "IDLE": {"description": "idle", "sign": "_"},
+            "PLANNED": {"description": "idle (planned)", "sign": "+"},
+            "INVAL": {"description": "Invalid", "sign": "I"},
+            "RESERVED": {"description": "idle (reserved)", "sign": "R"},
+            "MAINT": {"description": "idle (maintenance)", "sign": "M"},
+            "DRAINING": {
+                "description": "draining",
+                "sign": self._highlight("D", "red"),
+            },
+            "DRAINED": {"description": "drained", "sign": self._highlight(".", "red")},
+            "REBOOT": {
+                "description": "drained (reboot)",
+                "sign": self._highlight("B", "red"),
+            },
+            "DOWN": {"description": "down", "sign": self._highlight("X", "red")},
+            "UNKNOWN": {"description": "unknown", "sign": self._highlight("?", "red")},
+            "TOTAL": {"description": "total", "sign": " "},
+        }
+
+        for key in self.states:
+            self.states[key]["count"] = 0
+            desc_len = len(self.states[key]["description"])
+            if desc_len > self.desc_len:
+                self.desc_len = desc_len
+
+    def _generate_index(self, basename):
+        """Generate index for sorting on basename"""
+        return [int(y) if y.isdigit() else y for y in re.split(r"(\d+)", basename)]
+
+    def _get_nodes(self):
+        """Queries Slurm for node information"""
+        try:
+            self.nodes = pyslurm.Nodes.load()
+        # TODO: proper exception
+        except Exception:
+            print("Error: unable to get nodes from Slurm", file=sys.stderr)
+            sys.exit(1)
+
+    def _get_jobs(self):
+        """Queries Slurm for job information"""
+        try:
+            self.jobs = pyslurm.Jobs.load()
+        # TODO: proper exception
+        except Exception:
+            print("Error: unable to get jobs from Slurm", file=sys.stderr)
+            sys.exit(1)
+
+    def _parse_layout(self):
+        for rack, nodes in sorted(settings["STATIC_RACKLAYOUT"].items(), key=lambda x: x[0]):
+            self.racks.append(rack)
+            for slot, node in enumerate(nodes, start=1):
+                self.layout[node] = (rack, slot)
+
+    def _parse_position(self, node):
+        """Parses the hostname to a postion"""
+
+        if node in self.layout:
+            return self.layout[node]
+        elif settings["NODEXPR"]:
+            positions = re.search(rf"{settings['NODEXPR']}", node)
+            try:
+                rack = positions.group("racknr")
+                slot = int(positions.group("nodenr"))
+                return (rack, slot)
+            # TODO: proper exception
+            except Exception:
+                return False
+        return False
+
+    def _skip_node(self, node, attr):
+        """Skip node"""
+        # Skip certain nodes
+        if node in settings["EXCLUDED"]:
+            return True
+        if self.ignore and not attr["partitions"]:
+            return True
+        if not self._parse_position(node):
+            print(f"Can't find rack position for {node}", file=sys.stderr)
+            return True
+        return False
+
+    def _parse_nodes(self):
+        """Parses the node states and properties"""
+        racks = set()
+
+        for node, attr in self.nodes.items():
+            if self._skip_node(node, attr):
+                self.skip_nodes.add(node)
+                continue
+
+            # Extract some properties
+            states = attr.state.split("+")
+            # The first state is regarded as the primary state
+            state = states[0]
+            features = set(attr.available_features)
+            cpuload = attr.cpu_load
+            cpus = attr.total_cpus
+
+            # Calculate load for allocated nodes
+            load = None
+            if "IDLE" not in states and "DOWN" not in states:
+                try:
+                    load = float(cpuload) / cpus
+                # TODO: proper exception
+                except Exception:
+                    pass
+
+            # Undefined node states are set to UNKNOWN
+            if state not in self.states:
+                print(f'Error: state "{state}" is not defined', file=sys.stderr)
+                state = "UNKNOWN"
+            # DRAIN is more important than other states
+            elif "DRAIN" in states:
+                if "ALLOCATED" in states or "MIXED" in states:
+                    state = "DRAINING"
+                elif "REBOOT" not in states:
+                    state = "DRAINED"
+            elif state == "ALLOCATED":
+                if load and load >= 120:
+                    state = "OVERLOAD"
+                elif node in self.parallel:
+                    state = "PARALLEL"
+            elif "PLANNED" in states:
+                state = "PLANNED"
+
+            # Count states for the summary
+            self.states[state]["count"] += 1
+            self.states["TOTAL"]["count"] += 1
+
+            # Extract rack and slot number
+            # NOTE: false is handled by self._skip_node(), but it's very sloppy
+            rack, slot = self._parse_position(node)
+            if slot not in self.table:
+                self.table[slot] = dict()
+            racks.add(rack)
+
+            # Set sign to state or load
+            if self.printload and load is not None and state != "OVERLOAD":
+                # Set a load digit from 0-9
+                loaddigit = str(int(min(round(load / 10.0), 9)))
+                singlecore = 100.0 / cpus
+                # Flag notes with a load that one core could handle
+                if load <= singlecore:
+                    loaddigit = self._highlight("<", "red")
+                # Flag notes that need all cores
+                elif load > 100 - singlecore:
+                    loaddigit = ">"
+                sign = loaddigit
+            elif self.printload and state == "OVERLOAD":
+                # Flag notes with a too high load
+                sign = self._highlight(self.states[state]["sign"], "red")
+            else:
+                sign = self.states[state]["sign"]
+
+            # Check if node should be highlighted
+            self.table[slot][rack] = sign
+            if self.features and self.features.intersection(features):
+                self.table[slot][rack] = self._highlight(sign, "yellow")
+
+        # Set string length for print functions
+        self.count_len = len(str(self.states["TOTAL"]["count"]))
+        if not settings["STATIC_RACKLAYOUT"]:
+            self.racks = sorted(racks)
+
+    def _highlight(self, text, color):
+        """Highlight text for printed output"""
+        colors = {
+            "yellow": "\033[93m",
+            "red": "\033[31m",
+            "green": "\033[32m",
+            "reset": "\033[0m",
+        }
+        if color in colors:
+            return colors[color] + text + colors["reset"]
+        else:
+            return text
+
+    def _expand_nodes(self, nodes):
+        """Expands host ranges to a list of hostnames"""
+        # attempt to use python3-hostlist instead of deprecated Pyslurm API
+        try:
+            # https://www.nsc.liu.se/~kent/python-hostlist/
+            import hostlist
+
+            nodelist = hostlist.expand_hostlist(nodes) if nodes else []
+            return nodelist
+        except ImportError:
+            pass
+
+        # fallback to deprecated Pyslurm API to expand the nodeset
+        try:
+            # NOTE: This API is currently being completely reworked, and is subject to be removed
+            # in the future when a replacement is introduced
+            p = pyslurm.hostlist()
+            p.create(nodes)
+            nodelist = [n.decode() for n in p.get_list()]
+            p.destroy()
+            return nodelist
+        except AttributeError:
+            print("Could not expand nodeset. Install python3-hostlist or use new Pyslurm API.", file=sys.stderr)
+            sys.exit(1)
+
+    def _parse_jobs(self):
+        """Extracts hostnames from parallel jobs"""
+        for _, attr in self.jobs.items():
+            if attr.num_nodes > 1:
+                self.parallel |= set(self._expand_nodes(attr.allocated_nodes))
+
+    def print_table_90(self):
+        "Prints an overview of the nodes, rotated by 90 degrees"
+
+        racks = dict()
+        slot_length = 0
+
+        for rack in self.racks:
+            if rack not in racks:
+                racks[rack] = list()
+
+            for slot in self.table:
+                if rack in self.table[slot]:
+                    racks[rack].append(self.table[slot][rack])
+
+            if len(racks[rack]) > slot_length:
+                slot_length = len(racks[rack])
+
+        # print the 10 digit header
+        print("     ", end="")
+        for slot in range(1, slot_length + 1):
+            mod_then = slot % 10
+            if mod_then == 0 and len(str(slot)) == 2:
+                print(f"{str(slot)[0]} ", end="")
+            else:
+                print("  ", end="")
+
+        print("\nRack ", end="")
+        for slot in range(1, slot_length + 1):
+            mod_then = slot % 10
+            print(f"{mod_then} ", end="")
+        print()
+
+        for rack, nodes in racks.items():
+            print(f"{rack: <5}{' '.join(nodes)}")
+
+    def print_table(self):
+        """Prints an overview of the nodes"""
+        print("")
+        rack_lines = len(str(max(self.racks)))
+        slot_columns = len(str(max(self.table)))
+        rack_offset = " " * slot_columns
+
+        # Print the rack numbers
+        racks = [str(x)[::-1] for x in self.racks]
+        for line in range(rack_lines, 0, -1):
+            print(rack_offset, end=" ")
+            current = None
+            previous = None
+            for rack in racks:
+                if len(rack) >= line:
+                    digit = rack[line - 1]
+                    if len(rack) > line:
+                        pdigit = rack[line]
+                    else:
+                        pdigit = None
+                    if digit != current or pdigit != previous:
+                        current = digit
+                        previous = pdigit
+                        print(digit, end=" ")
+                    else:
+                        print(" ", end=" ")
+                else:
+                    print(" ", end=" ")
+            print("")
+
+        # Print the slot numbers and nodes
+        for slot in sorted(self.table):
+            print(str(slot).rjust(slot_columns), end=" ")
+            for rack in self.racks:
+                if rack in self.table[slot]:
+                    print(self.table[slot][rack], end=" ")
+                else:
+                    print(" ", end=" ")
+            print("")
+
+    def print_node_info(self, skip_shared, load_treshold, mem_factor, parsable):
+        """Print node info with state, load, job"""
+        n2j = dict()
+        len_user = len_job = len_node = 1
+        len_load = 5
+        len_mem = 7
+
+        for node, attr in self.nodes.items():
+            if node in self.skip_nodes:
+                continue
+
+            # print only nodes with requested feature
+            if self.features and not self.features.intersection(set(attr.available_features)):
+                continue
+
+            if "ALLOCATED" in attr.state or "MIXED" in attr.state:
+                if skip_shared and "MIXED" in attr.state:
+                    n2j.pop(node)
+                    continue
+
+                n2j[node] = dict()
+                n2j[node]["state"] = attr.state
+                n2j[node]["real_memory"] = attr.real_memory
+                n2j[node]["alloc_mem"] = attr.allocated_memory
+                n2j[node]["free_mem"] = attr.free_memory
+                n2j[node]["used_mem"] = attr.real_memory - attr.free_memory
+
+                if n2j[node]["free_mem"] / n2j[node]["real_memory"] < mem_factor and not parsable:
+                    n2j[node]["free_mem"] = self._highlight(str(n2j[node]["free_mem"]).rjust(len_mem), "red")
+                else:
+                    n2j[node]["free_mem"] = str(n2j[node]["free_mem"])
+
+                alloc_cpus = float(attr.allocated_cpus)
+                cpu_load = float(attr.cpu_load) / alloc_cpus * 100
+
+                if abs(cpu_load - 100) > load_treshold and not parsable:
+                    n2j[node]["cpu_load"] = self._highlight(str(int(cpu_load)).rjust(len_load), "red")
+                else:
+                    n2j[node]["cpu_load"] = str(int(cpu_load))
+
+        for job, attr in self.jobs.items():
+            if attr.allocated_nodes and "RUNNING" in attr.state:
+                if attr.num_nodes > 1:
+                    nodes = self._expand_nodes(attr.allocated_nodes)
+                else:
+                    nodes = [attr.allocated_nodes]
+                for n in nodes:
+                    if n not in n2j:
+                        continue
+                    if "job" not in n2j[n]:
+                        n2j[n]["job"] = str(job)
+                    elif skip_shared:
+                        n2j[n].pop("job")
+                        n2j[n].pop("user")
+                        continue
+                    else:
+                        n2j[n]["job"] += "," + str(job)
+                    tmp_len = len(n2j[n]["job"])
+                    if tmp_len > len_job:
+                        len_job = tmp_len
+
+                    user = attr.user_name
+                    if "user" not in n2j[n]:
+                        n2j[n]["user"] = {user}
+                    else:
+                        n2j[n]["user"].add(user)
+                    tmp_len = len(",".join(n2j[n]["user"]))
+                    if tmp_len > len_user:
+                        len_user = tmp_len
+
+                    if len(n) > len_node:
+                        len_node = len(n)
+
+        if not parsable:
+            print(
+                "%-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s | %-*s"
+                % (
+                    len_node,
+                    "Node",
+                    len_job,
+                    "Job",
+                    len_user,
+                    "User",
+                    len_load,
+                    "Load",
+                    len_mem,
+                    "RMem",
+                    len_mem,
+                    "AMem",
+                    len_mem,
+                    "FMem",
+                    len_mem,
+                    "UMem",
+                )
+            )
+        else:
+            print("{}|{}|{}|{}|{}|{}|{}|{}".format("Node", "Job", "User", "Load", "RMem", "AMem", "FMem", "UMem"))
+
+        for n in n2j:
+            try:
+                if not parsable:
+                    print(
+                        "%-*s | %-*s | %-*s | %*s | %*d | %*d | %*s | %*d"
+                        % (
+                            len_node,
+                            n,
+                            len_job,
+                            n2j[n]["job"],
+                            len_user,
+                            ",".join(n2j[n]["user"]),
+                            len_load,
+                            n2j[n]["cpu_load"],
+                            len_mem,
+                            n2j[n]["real_memory"],
+                            len_mem,
+                            n2j[n]["alloc_mem"],
+                            len_mem,
+                            n2j[n]["free_mem"],
+                            len_mem,
+                            n2j[n]["used_mem"],
+                        )
+                    )
+                else:
+                    print(
+                        "%s|%s|%s|%s|%d|%d|%s|%d"
+                        % (
+                            n,
+                            n2j[n]["job"],
+                            ",".join(n2j[n]["user"]),
+                            n2j[n]["cpu_load"],
+                            n2j[n]["real_memory"],
+                            n2j[n]["alloc_mem"],
+                            n2j[n]["free_mem"],
+                            n2j[n]["used_mem"],
+                        )
+                    )
+            except KeyError:
+                pass
+
+    def print_summary(self):
+        """Prints a summary of the node status"""
+        print("")
+        for state in self.states:
+            sign = self.states[state]["sign"]
+            description = self.states[state]["description"]
+            count = str(self.states[state]["count"])
+            print(f"{sign} {description.ljust(self.desc_len)}: {count.rjust(self.count_len)}")
+
+    def print_load_legend(self):
+        """Prints a simple legend for the cpu load option"""
+        print("")
+        load_signs = [
+            [self._highlight("<", "red"), "less than single core load"],
+            ["6", "cpu load divided by 10 (~60%)"],
+            [">", "all cores are being used"],
+            [self._highlight("*", "red"), "too much cpu load"],
+        ]
+        for sign in load_signs:
+            print(f"{sign[0]} {sign[1]}")
+
+
+if __name__ == "__main__":
+    # Arguments
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("-a", "--all", action="store_true", help="show table and summary")
+    parser.add_argument("-s", "--summary", action="store_true", help="show summary")
+    parser.add_argument("-i", "--ignore", action="store_true", help="ignore nodes without partitions")
+    parser.add_argument(
+        "-c",
+        "--cpu-load",
+        dest="printload",
+        action="store_true",
+        help="cpu load instead of state for active nodes",
+    )
+    parser.add_argument(
+        "-f",
+        "--features",
+        default="",
+        help="highlight nodes with features (comma seperated)",
+    )
+    parser.add_argument(
+        "-l",
+        "--list",
+        action="store_true",
+        help="Show node rows with state and job info",
+    )
+    parser.add_argument(
+        "--skip-shared",
+        action="store_true",
+        help="Don't print information for shared nodes",
+    )
+    parser.add_argument(
+        "--load-treshold",
+        type=int,
+        default=2,
+        help="Warning treshold delta for normalized CPU load",
+    )
+    parser.add_argument(
+        "--mem-factor",
+        type=float,
+        default=0.1,
+        help="Warning treshold factor for free memory",
+    )
+    parser.add_argument("-p", "--parsable", action="store_true", help="print parsable output")
+    parser.add_argument(
+        "--conf",
+        type=str,
+        default=f"{os.path.dirname(os.path.abspath(__file__))}/../etc/smon.conf",
+        help="Path to configuration file",
+    )
+    parser.add_argument("--version", action="version", version=pyslurm.__version__)
+
+    # Parse the arguments
+    args = parser.parse_args()
+
+    # Load settings
+    settings = read_conf(args.conf, settings)
+
+    # Initialize Smon class
+    smon = Smon(ignore=args.ignore, features=args.features, printload=args.printload)
+
+    if args.list:
+        smon.print_node_info(
+            skip_shared=args.skip_shared,
+            load_treshold=args.load_treshold,
+            mem_factor=args.mem_factor,
+            parsable=args.parsable,
+        )
+        sys.exit(0)
+
+    # Print requested output
+    if not args.summary:
+        if "ROTATE_90" in settings and settings["ROTATE_90"]:
+            smon.print_table_90()
+        else:
+            smon.print_table()
+    if args.printload:
+        smon.print_load_legend()
+    if args.all or args.summary:
+        smon.print_summary()
