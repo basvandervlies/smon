@@ -12,8 +12,10 @@ EXCLUDED: []
 
 # --- slurmrestd ------------------------------------------------------------
 # http://host:port, https://proxy/path or unix:/path/to/slurmrestd.socket
+# {domain} is replaced by the domain name of this host, e.g. on
+# batch.mgt.example.org: https://slurmrestd.mgt.example.org
 # Overridden by $SLURMRESTD_URL and --url.
-SLURMRESTD_URL: http://localhost:6820
+SLURMRESTD_URL: https://slurmrestd.{domain}
 # Empty: use the newest of v0.0.45 .. v0.0.40 that slurmrestd offers.
 SLURMRESTD_API_VERSION: ''
 # Act as this user with a root/SlurmUser JWT ($SLURM_JWT).

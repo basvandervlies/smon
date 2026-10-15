@@ -52,7 +52,8 @@ DOWN_STATES = {
 # command line (--url, --api-version).
 settings = {
     #   http://host:6820   https://proxy/slurmrestd   unix:/run/slurmrestd/slurmrestd.socket
-    "SLURMRESTD_URL": "http://localhost:6820",
+    # {domain} is replaced by the domain name of this host
+    "SLURMRESTD_URL": "https://slurmrestd.{domain}",
     # empty -> use the newest version offered by slurmrestd
     "SLURMRESTD_API_VERSION": "",
     # user to act as with a root/SlurmUser JWT; empty -> the user in the token
@@ -233,6 +234,22 @@ class SlurmRestClient:
             return
         for name in names:
             self.post(f"node/{quote(name, safe='')}", changes)
+
+
+def _expand_url(url):
+    """Replace {domain} in the URL by the domain name of this host
+
+    e.g. https://slurmrestd.{domain} on batch.mgt.example.org becomes
+    https://slurmrestd.mgt.example.org
+    """
+    if "{domain}" not in url:
+        return url
+    fqdn = socket.getfqdn()
+    domain = fqdn.split(".", 1)[1] if "." in fqdn else ""
+    if not domain:
+        # no domain known, use the plain host name
+        return url.replace(".{domain}", "").replace("{domain}", "")
+    return url.replace("{domain}", domain)
 
 
 def _fetch_token(scontrol, lifespan, user=""):
@@ -842,7 +859,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--url",
-        help="slurmrestd URL (http://host:port, https://..., unix:/path/to/socket)",
+        help="slurmrestd URL (http://host:port, https://..., unix:/path/to/socket), {domain} is "
+        "replaced by the domain of this host (default: https://slurmrestd.{domain})",
     )
     parser.add_argument(
         "--api-version",
@@ -872,7 +890,7 @@ if __name__ == "__main__":
     if os.path.exists(args.conf):
         settings = read_conf(args.conf, settings)
     # Connect to slurmrestd: command line > environment > configuration file
-    url = args.url or os.environ.get("SLURMRESTD_URL") or settings["SLURMRESTD_URL"]
+    url = _expand_url(args.url or os.environ.get("SLURMRESTD_URL") or settings["SLURMRESTD_URL"])
     token = os.environ.get("SLURM_JWT")
     if not token and settings["SLURMRESTD_AUTO_TOKEN"]:
         try:
