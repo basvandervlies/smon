@@ -784,16 +784,70 @@ class SaraNodes(object):
             print(f"slurmrestd update {nodeset}: {json.dumps(changes)}")
 
 
-def read_conf(path, settings):
-    """Read the slurmrestd settings from the (smon) YAML configuration file"""
+APPS = ("smon", "snodes")
+
+
+def _read_yaml(path):
     try:
         import yaml
     except ImportError:
         print("Error: PyYAML is needed to read a configuration file", file=sys.stderr)
         sys.exit(1)
-    with open(path) as conf:
-        conf_settings = yaml.safe_load(conf) or {}
-    return {**settings, **{k: v for k, v in conf_settings.items() if k in settings}}
+    try:
+        with open(path) as conf:
+            data = yaml.safe_load(conf) or {}
+    except (OSError, yaml.YAMLError) as err:
+        print(f"Error: cannot read configuration file {path}: {err}", file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(data, dict):
+        print(f"Error: {path} is not a YAML mapping of settings", file=sys.stderr)
+        sys.exit(1)
+    return data
+
+
+def load_settings(app, settings, conf=None):
+    """Load settings from sapi.conf
+
+    The file has a 'global' section with the slurmrestd connection settings
+    (SLURMRESTD_*) for all applications and a section per application
+    ('smon', 'snodes') that overrides them. Precedence: built-in defaults <
+    global < application section.
+
+    Without --conf ../etc/sapi.conf is used, or else the old flat
+    ../etc/smon.conf. Returns (settings, path or None).
+    """
+    if conf:
+        if not os.path.exists(conf):
+            print(f"Error: configuration file {conf} does not exist", file=sys.stderr)
+            sys.exit(1)
+        path = conf
+    else:
+        etc = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "etc"))
+        found = [p for p in (f"{etc}/sapi.conf", f"{etc}/smon.conf") if os.path.exists(p)]
+        if not found:
+            return settings, None
+        path = found[0]
+
+    data = _read_yaml(path)
+    settings = dict(settings)
+    if not any(section in data for section in ("global",) + APPS):
+        # old flat smon.conf: use the settings this application knows
+        settings.update({k: v for k, v in data.items() if k in settings})
+        return settings, path
+
+    connection = {k for k in settings if k.startswith("SLURMRESTD_")}
+    for section in sorted(set(data) - {"global", *APPS}):
+        print(f"Warning: unknown section '{section}' in {path}", file=sys.stderr)
+    for section, allowed in (("global", connection), (app, set(settings))):
+        values = data.get(section) or {}
+        if not isinstance(values, dict):
+            print(f"Error: section '{section}' in {path} is not a mapping", file=sys.stderr)
+            sys.exit(1)
+        for key in sorted(set(values) - allowed):
+            where = "only SLURMRESTD_* settings belong in 'global'" if section == "global" else "unknown setting"
+            print(f"Warning: {path} [{section}] {key}: {where}", file=sys.stderr)
+        settings.update({k: v for k, v in values.items() if k in allowed})
+    return settings, path
 
 
 if __name__ == "__main__":
@@ -854,8 +908,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--conf",
         type=str,
-        default=f"{os.path.dirname(os.path.abspath(__file__))}/../etc/smon.conf",
-        help="configuration file with the SLURMRESTD_* settings (optional, shared with smon)",
+        help="configuration file (default: ../etc/sapi.conf, else ../etc/smon.conf; optional)",
     )
     parser.add_argument(
         "--url",
@@ -887,8 +940,11 @@ if __name__ == "__main__":
     if args.clear_ticket:
         args.ticket = ""
 
-    if os.path.exists(args.conf):
-        settings = read_conf(args.conf, settings)
+    # Configuration: global section < snodes section (both optional)
+    settings, conf_path = load_settings("snodes", settings, args.conf)
+    if ARGS_DEBUG:
+        print(f"func:__main__ configuration file: {conf_path}", file=sys.stderr)
+
     # Connect to slurmrestd: command line > environment > configuration file
     url = _expand_url(args.url or os.environ.get("SLURMRESTD_URL") or settings["SLURMRESTD_URL"])
     token = os.environ.get("SLURM_JWT")

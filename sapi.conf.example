@@ -1,0 +1,41 @@
+# Configuration for smon and snodes (YAML)
+#
+# Default location: ../etc/sapi.conf relative to the scripts, e.g.
+# /opt/slurm/etc/sapi.conf for /opt/slurm/bin/smon. Use --conf FILE
+# for another file. An old flat smon.conf is still read when this file is
+# not present.
+#
+# Precedence, last one wins:
+#   built-in defaults < global < application section
+#   < $SLURMRESTD_URL / $SLURM_JWT < --url / --api-version
+
+# Settings for all applications: only the slurmrestd connection settings
+global:
+  # https://host, http://host:port, https://proxy/path or unix:/path/to/socket
+  # {domain} is replaced by the domain name of this host
+  SLURMRESTD_URL: https://slurmrestd.{domain}
+  # Empty: use the newest of v0.0.45 .. v0.0.40 that slurmrestd offers
+  SLURMRESTD_API_VERSION: ''
+  # Act as this user with a root/SlurmUser JWT. Empty: the user of the token
+  SLURMRESTD_USER: ''
+  SLURMRESTD_TIMEOUT: 30
+  # Without $SLURM_JWT run 'scontrol token' and use that token for this run
+  SLURMRESTD_AUTO_TOKEN: true
+  SLURMRESTD_TOKEN_LIFESPAN: 30
+  SLURMRESTD_SCONTROL: scontrol
+
+smon:
+  # Regex with the named groups 'racknr' and 'nodenr' to derive the position
+  # of a node from its hostname, e.g. r12n07 -> rack 12, slot 7
+  NODEXPR: 'r(?P<racknr>\d+)n(?P<nodenr>\d+)'
+  # or a static layout (rack: [nodes in slot order])
+  # STATIC_RACKLAYOUT:
+  #   rack1: [node001, node002]
+  EXCLUDED: []
+  ROTATE_90: false
+  # Any SLURMRESTD_* setting here overrides the global one for smon only
+
+snodes:
+  # Any SLURMRESTD_* setting here overrides the global one for snodes only,
+  # e.g. a longer timeout for node updates:
+  # SLURMRESTD_TIMEOUT: 60
