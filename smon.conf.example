@@ -16,6 +16,13 @@ EXCLUDED: []
 SLURMRESTD_URL: http://localhost:6820
 # Empty: use the newest of v0.0.45 .. v0.0.40 that slurmrestd offers.
 SLURMRESTD_API_VERSION: ''
-# User name sent with the JWT ($SLURM_JWT). Empty: the current user.
+# Act as this user with a root/SlurmUser JWT ($SLURM_JWT).
+# Empty: the user the token was issued for.
 SLURMRESTD_USER: ''
 SLURMRESTD_TIMEOUT: 30
+# Without $SLURM_JWT run 'scontrol token' and use that token for this run.
+# The token is for the user running smon/snodes (or SLURMRESTD_USER, which
+# only root/SlurmUser may request).
+SLURMRESTD_AUTO_TOKEN: true
+SLURMRESTD_TOKEN_LIFESPAN: 30
+SLURMRESTD_SCONTROL: scontrol

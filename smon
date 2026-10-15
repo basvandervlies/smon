@@ -21,6 +21,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 from types import SimpleNamespace
 from urllib.parse import urlparse
@@ -43,6 +44,10 @@ settings = {
     # user to act as with a root/SlurmUser JWT; empty -> the user in the token
     "SLURMRESTD_USER": "",
     "SLURMRESTD_TIMEOUT": 30,
+    # Without $SLURM_JWT get a token with 'scontrol token' for every run
+    "SLURMRESTD_AUTO_TOKEN": True,
+    "SLURMRESTD_TOKEN_LIFESPAN": 30,
+    "SLURMRESTD_SCONTROL": "scontrol",
 }
 
 # data_parser versions this program understands, newest first. The fields
@@ -95,7 +100,7 @@ class SlurmRestClient:
             if user:
                 self.headers["X-SLURM-USER-NAME"] = user
         elif self.scheme != "unix":
-            raise SlurmRestError("no JWT found, set SLURM_JWT, e.g.: export $(scontrol token lifespan=3600)")
+            raise SlurmRestError("no JWT, set SLURM_JWT (export $(scontrol token)) or SLURMRESTD_AUTO_TOKEN: true")
 
     def _connection(self):
         if self.scheme == "unix":
@@ -165,6 +170,27 @@ class SlurmRestClient:
         raise SlurmRestError(
             f"slurmrestd at {self.url} offers none of the supported API versions ({', '.join(API_VERSIONS)})"
         )
+
+
+def _fetch_token(scontrol, lifespan, user=""):
+    """Get a short lived JWT for this run with 'scontrol token'
+
+    Without a user name the token is for the user running this program.
+    A user name (SLURMRESTD_USER) is only allowed for root/SlurmUser.
+    """
+    cmd = [scontrol, "token", f"lifespan={int(lifespan)}"]
+    if user:
+        cmd.append(f"username={user}")
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        raise SlurmRestError(f"cannot run '{' '.join(cmd)}': {err}")
+    if out.returncode != 0:
+        raise SlurmRestError(f"'{' '.join(cmd)}' failed: {(out.stderr or out.stdout).strip()}")
+    for line in out.stdout.splitlines():
+        if line.startswith("SLURM_JWT="):
+            return line.split("=", 1)[1].strip()
+    raise SlurmRestError(f"no SLURM_JWT in the output of '{' '.join(cmd)}'")
 
 
 def _number(value, default=None):
@@ -764,12 +790,27 @@ if __name__ == "__main__":
     settings = read_conf(args.conf, settings)
 
     # Connect to slurmrestd: command line > environment > configuration file
+    url = args.url or os.environ.get("SLURMRESTD_URL") or settings["SLURMRESTD_URL"]
+    token = os.environ.get("SLURM_JWT")
+    if not token and settings["SLURMRESTD_AUTO_TOKEN"]:
+        try:
+            token = _fetch_token(
+                settings["SLURMRESTD_SCONTROL"],
+                settings["SLURMRESTD_TOKEN_LIFESPAN"],
+                settings["SLURMRESTD_USER"],
+            )
+        except SlurmRestError as err:
+            # a unix socket may still work with local authentication
+            if not url.startswith("unix:"):
+                print(f"Error: {err}", file=sys.stderr)
+                sys.exit(1)
+            print(f"Warning: {err}, trying local authentication", file=sys.stderr)
     try:
         client = SlurmRestClient(
-            url=args.url or os.environ.get("SLURMRESTD_URL") or settings["SLURMRESTD_URL"],
+            url=url,
             version=args.api_version or settings["SLURMRESTD_API_VERSION"],
             user=settings["SLURMRESTD_USER"],
-            token=os.environ.get("SLURM_JWT"),
+            token=token,
             timeout=settings["SLURMRESTD_TIMEOUT"],
         )
     except SlurmRestError as err:
